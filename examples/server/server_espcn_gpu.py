@@ -20,6 +20,7 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 from PIL import Image
 from espcn_pytorch import ESPCN
+import torch
 
 model = None
 pil2tensor = None
@@ -67,60 +68,68 @@ class VideoTransformTrack(MediaStreamTrack):
             global model
             global pil2tensor
 
-            #SR
-            img1 = frame.to_ndarray(format="bgr24")
+            # frame is in YUV format.
+            # Y = luminance: black & white TV (or Luma, or gamma)
+            # U = color information
+            # V = color information
+           
+            data = frame.to_ndarray()
 
-            new_size = (426, 240)
+            # y = 480 x 640
+            y = data[:frame.height]
 
-            # resize image
-            img2 = cv2.resize(img1, new_size, interpolation = cv2.INTER_CUBIC)
+            # uv = 2, 230, 320
+            uv = data[frame.height:].reshape(2, frame.height // 2, frame.width // 2)
 
-            img = Image.fromarray(cv2.cvtColor(img2, cv2.COLOR_BGR2RGB)).convert("YCbCr")
-            y, cb, cr = img.split()
-            img = pil2tensor(y).view(1, -1, y.size[1], y.size[0])
-            img = img.to(device)
+            # The input dimensions are interpreted in the form: 
+            # mini-batch x channels x [optional depth] x [optional height] x width.
+            #
+            # y = 480 x 640
+            y = y.reshape(1, 1, *y.shape)
+            y = torch.tensor(y, dtype=torch.float32).to(device)  # convert to PyTorch Tensor
+            y = torch.nn.functional.interpolate(y, scale_factor=2, mode='bicubic', align_corners=False)
+            y = y.to(torch.uint8).cpu().numpy().squeeze()  # convert back to NumPy array
 
-            with torch.no_grad():
-                prediction = model(img)
+            # uv = 2 x 240 x 320
+            uv = uv.reshape(1, *uv.shape)
+            uv = torch.tensor(uv, dtype=torch.float32).to(device)  # convert to PyTorch Tensor
+            uv = torch.nn.functional.interpolate(uv, scale_factor=2, mode='bicubic', align_corners=False)
+            uv = uv.to(torch.uint8).cpu().numpy().squeeze()  # convert back to NumPy array
 
-            prediction = prediction.cpu()
-            sr_frame_y = prediction[0].detach().numpy()
-            sr_frame_y *= 255.0
-            sr_frame_y = sr_frame_y.clip(0, 255)
-            sr_frame_y = Image.fromarray(np.uint8(sr_frame_y[0]), mode="L")
+            # Merge Y and UV
+            new_data = np.vstack((y, uv.reshape(-1, 2 * frame.width)))
 
-            sr_frame_cb = cb.resize(sr_frame_y.size, Image.BICUBIC)
-            sr_frame_cr = cr.resize(sr_frame_y.size, Image.BICUBIC)
-            sr_frame = Image.merge("YCbCr", [sr_frame_y, sr_frame_cb, sr_frame_cr]).convert("RGB")
-            # before converting the result in RGB
-            sr_frame = cv2.cvtColor(np.asarray(sr_frame), cv2.COLOR_RGB2BGR)
+            # Superres only the Y channel (expensive).
+            # Bicubic scaling on U and V channels (cheap-ish)
 
             # rebuild a VideoFrame, preserving timing information
-            new_frame = VideoFrame.from_ndarray(sr_frame, format="bgr24")
+            new_frame = VideoFrame.from_ndarray(new_data, format="yuv420p")
             new_frame.pts = frame.pts
             new_frame.time_base = frame.time_base
+            
             return new_frame
 
         if self.transform == "twotimes":
             sf = 2
             weight = 'weights/espcn_2x.pth'
-            print("---------------------TWO times selected------------------------")
+            #print("---------------------TWO times selected------------------------")
         elif self.transform == "threetimes":
             sf = 3
             weight = 'weights/espcn_3x.pth'
-            print("---------------------THREE times selected------------------------")
+            #print("---------------------THREE times selected------------------------")
         elif self.transform == "fourtimes":
             sf = 4
             weight = 'weights/espcn_4x.pth'
-            print("---------------------FOUR times selected------------------------")
+            #print("---------------------FOUR times selected------------------------")
         elif self.transform == "eighttimes":
             sf = 8
             weight = 'weights/espcn_8x.pth'
-            print("---------------------EIGHT times selected------------------------")
+            #print("---------------------EIGHT times selected------------------------")
         else:
             return frame
 
         if model is None:
+            print(f'Doing superresolution with scaling factor of {sf}x')
             SuperResolution_init(sf, weight)
 
         return SuperResolution()
